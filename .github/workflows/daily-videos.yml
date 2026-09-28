@@ -1,0 +1,204 @@
+name: Daily YouTube videos
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_type:
+        description: "Type de video a generer"
+        type: choice
+        options: [short, long]
+        default: short
+      publish:
+        description: "Publier sur YouTube (decoche pour un run de test)"
+        type: boolean
+        default: false
+  schedule:
+    # Un cron GitHub Actions est fixe en UTC et ne suit PAS le changement d'heure ete/hiver. Plutot
+    # que de figer un horaire UTC qui deriverait d'1h a chaque bascule, on declare DEUX jeux de cron
+    # couvrant les 3 horaires locaux Paris (8h et 21h pour les shorts, 19h pour la longue - reduit de
+    # 5 a 3 videos/jour le 28/09/2026, demande explicite "passe a 3 videos par jour et reste comme ca" ;
+    # on garde les 2 creneaux d'engagement les plus efficaces, reveil/trajet et prime time soir, et on
+    # abandonne la pause dejeuner/fin d'apres-midi) : un en
+    # supposant l'heure d'hiver (UTC+1) et un en supposant l'heure d'ete (UTC+2). A chaque
+    # declenchement, le step "Determiner le type de run" recalcule l'heure locale Paris REELLE au
+    # moment du run et decide quoi faire - celui des deux jeux qui ne correspond pas a la saison en
+    # cours se resout juste en "skip" (quelques secondes, aucun cout sur un repo public). Plus jamais
+    # besoin de toucher ces lignes a la main.
+    # Minute decalee a :07 (pas :00) : GitHub documente que le debut de chaque heure est la periode
+    # de plus forte charge pour les cron, avec un risque de retard/saut plus eleve pile a la minute 0.
+    # MALGRE CA, le schedule s'est de nouveau completement tu du 27/09 21h17 au 28/09 07h41+ (aucun
+    # declenchement du tout, meme pas un "skip") - deuxieme fois que ca arrive. Comportement connu et
+    # documente comme peu fiable pour les schedules GitHub Actions nouvellement crees/modifies : ca
+    # semble redemarrer a chaque push touchant le repo. Pas de fix garanti cote GitHub - seul palliatif
+    # trouve : pousser un commit relance le declenchement pour un moment. Voir aussi le matching par
+    # fenetre de tolerance plus bas (protection contre le retard de 50-70min constate en pratique sur
+    # les rares declenchements reels, qui faisait sinon systematiquement tomber en "skip").
+    - cron: "7 7,18,20 * * *"  # hypothese heure d'hiver (UTC+1)
+    - cron: "7 6,17,19 * * *"  # hypothese heure d'ete (UTC+2)
+
+permissions:
+  contents: write
+
+# GitHub ne rattrape jamais un cron manque (contrairement au Planificateur de taches Windows) : si le
+# runner est indisponible au moment prevu, ce declenchement est simplement saute, pas mis en file
+# d'attente pour plus tard. Ce concurrency group empeche seulement un chevauchement improbable entre
+# deux declenchements presque simultanes (ex: un run manuel de test pendant un cron).
+concurrency:
+  group: youtube-pipeline
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determiner le type de run (long/short/skip) et si on publie
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_type=${{ inputs.run_type }}" >> "$GITHUB_OUTPUT"
+            echo "publish=${{ inputs.publish }}" >> "$GITHUB_OUTPUT"
+          else
+            today=$(TZ=Europe/Paris date +%F)
+            now_min=$(( 10#$(TZ=Europe/Paris date +%H) * 60 + 10#$(TZ=Europe/Paris date +%M) ))
+            echo "Heure locale Paris actuelle : $(TZ=Europe/Paris date +%H:%M) (${today})"
+
+            # GitHub retarde parfois un declenchement planifie de 50-70min (constate en pratique les
+            # 27 et 28/09/2026) - un match strict sur l'heure exacte ratait alors systematiquement le
+            # creneau (tombait en "skip"). On cherche maintenant le creneau cible le plus proche dans
+            # une fenetre de tolerance de 100 minutes, et on garde une trace (output/last_auto_run.json,
+            # commitee comme le reste de l'historique) du dernier creneau deja traite pour ne jamais
+            # publier deux fois le meme creneau si les deux jeux de cron (hiver/ete) finissent par
+            # matcher le meme jour a cause du retard.
+            best_type=""; best_target=""; best_diff=999
+            for entry in "long:19" "short:08" "short:21"; do
+              type="${entry%%:*}"; target="${entry##*:}"
+              target_min=$(( 10#$target * 60 ))
+              diff=$(( now_min - target_min )); [ "$diff" -lt 0 ] && diff=$(( -diff ))
+              if [ "$diff" -le 100 ] && [ "$diff" -lt "$best_diff" ]; then
+                best_diff=$diff; best_type="$type"; best_target="$target"
+              fi
+            done
+
+            already_done=""
+            if [ -n "$best_target" ] && [ -f output/last_auto_run.json ]; then
+              expected="{\"date\": \"$today\", \"slot\": \"$best_target\"}"
+              if [ "$(cat output/last_auto_run.json)" = "$expected" ]; then
+                already_done="yes"
+              fi
+            fi
+
+            if [ -z "$best_target" ]; then
+              echo "Aucun creneau a moins de 100min de l'heure actuelle - rien a faire."
+              echo "run_type=skip" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            elif [ "$already_done" = "yes" ]; then
+              echo "Creneau ${best_target}h deja traite aujourd'hui (protection anti-doublon) - rien a faire."
+              echo "run_type=skip" >> "$GITHUB_OUTPUT"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Creneau ${best_target}h retenu (ecart ${best_diff}min) -> ${best_type}"
+              echo "run_type=${best_type}" >> "$GITHUB_OUTPUT"
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              mkdir -p output
+              printf '{"date": "%s", "slot": "%s"}' "$today" "$best_target" > output/last_auto_run.json
+            fi
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.pick.outputs.run_type != 'skip'
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dependances Python
+        if: steps.pick.outputs.run_type != 'skip'
+        run: pip install -r requirements.txt
+
+      - name: Installer une police de secours pour les sous-titres/miniatures (Arial Black/Impact n'existent pas sur Linux)
+        if: steps.pick.outputs.run_type != 'skip'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y fonts-dejavu-core
+          fc-cache -f
+
+      # Place AVANT l'installation d'Ollama : si le cache existe deja, "ollama pull" plus bas
+      # detectera les blobs deja presents et ne retelechargera que ce qui manque (au lieu de
+      # retelecharger le modele ~2 Go a chaque run).
+      - name: Restaurer le cache du modele Ollama
+        if: steps.pick.outputs.run_type != 'skip'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-llama3.2-3b
+
+      - name: Installer et demarrer Ollama, telecharger le modele
+        if: steps.pick.outputs.run_type != 'skip'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > ollama_serve.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434/ >/dev/null && break
+            sleep 1
+          done
+          ollama pull llama3.2:3b
+
+      - name: Preparer les secrets YouTube/Pexels
+        if: steps.pick.outputs.run_type != 'skip'
+        env:
+          YOUTUBE_CLIENT_SECRET_B64: ${{ secrets.YOUTUBE_CLIENT_SECRET_B64 }}
+          YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
+        run: |
+          echo "$YOUTUBE_CLIENT_SECRET_B64" | base64 -d > client_secret.json
+          echo "$YOUTUBE_TOKEN_B64" | base64 -d > token.json
+
+      # edge-tts (voix off) echoue de temps en temps avec "NoAudioReceived" - probleme flaky cote
+      # backend Microsoft, deja rencontre sur le PC (voir run_pipeline_safe.ps1, meme logique de
+      # retry ci-dessous : 3 tentatives, pause 60s entre chaque).
+      - name: Lancer le pipeline (video longue)
+        if: steps.pick.outputs.run_type == 'long'
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          SUBTITLE_FONT_NAME: "DejaVu Sans"
+          PUBLISHED_DIR: ${{ runner.temp }}/published
+        run: |
+          ARGS="--publish"
+          if [ "${{ steps.pick.outputs.publish }}" != "true" ]; then ARGS=""; fi
+          for attempt in 1 2 3; do
+            python run_pipeline.py $ARGS && break
+            echo "Echec tentative $attempt/3"
+            if [ "$attempt" = "3" ]; then exit 1; fi
+            sleep 60
+          done
+
+      - name: Lancer le pipeline (short)
+        if: steps.pick.outputs.run_type == 'short'
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          SUBTITLE_FONT_NAME: "DejaVu Sans"
+          PUBLISHED_DIR: ${{ runner.temp }}/published
+        run: |
+          ARGS="--publish"
+          if [ "${{ steps.pick.outputs.publish }}" != "true" ]; then ARGS=""; fi
+          for attempt in 1 2 3; do
+            python run_shorts_pipeline.py $ARGS && break
+            echo "Echec tentative $attempt/3"
+            if [ "$attempt" = "3" ]; then exit 1; fi
+            sleep 60
+          done
+
+      - name: Sauvegarder l'historique des sujets/titres (evite les repetitions entre deux runs)
+        if: always()
+        run: |
+          rm -f client_secret.json token.json
+          git add -- output/used_topics.json output/used_titles.json output/priority_topics.json
+          [ -f output/last_auto_run.json ] && git add -- output/last_auto_run.json
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau a committer."
+            exit 0
+          fi
+          git config user.name "youtube-ai-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git commit -m "chore: mise a jour historique sujets/titres [skip ci]"
+          git push
